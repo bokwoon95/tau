@@ -147,16 +147,29 @@ Use a small explicit state machine with a control state and the six operation mo
 
 ### Control commands
 
-- In control state, a whole response `@@tau mode NAME` enters one of the six modes. Names are lowercase and case-sensitive. Acknowledge the transition and request mode-specific content on the next model turn.
+- In control state or any active mode, first line `@@tau mode NAME` followed by LF/CRLF and a nonempty remainder selects one of the six modes and submits that remainder as one action in the selected mode. Names are lowercase and case-sensitive. Direct switching between modes is allowed; no prior exit is required. Selecting the current mode is also valid and never resets its process.
+- A header-only response `@@tau mode NAME`, with zero or one final LF/CRLF, selects the mode without an action. This optional standalone transition must never be required before submitting an action.
 - In an active mode, a whole response `@@tau exit` returns to control. Exiting a mode does not destroy its language process.
 - In control state, first line `@@tau final` followed by a line ending and answer text completes the current user turn. Remain in control for the next user prompt.
 - Other control-state responses, unknown modes/commands, and control commands in the wrong state produce actionable protocol-error feedback with bounded recovery.
 
-Mode selection and action payloads are separate responses. Recognize whole-response commands only as the exact command with zero or one final LF/CRLF; do not use unrestricted whitespace trimming. The final-answer form is explicitly a first-line header. Do not extract commands from arbitrary source lines, strings, Markdown, or fenced blocks.
+**Mode selection and its action payload must be supported in the same streamed assistant response to a single model request.** For example:
+
+```text
+@@tau mode python
+x = 40
+print(x + 2)
+```
+
+The harness waits for that completed response, selects Python, and executes its payload. Do not insert a separate acknowledgement/model request between selection and execution. Report the transition and execution result together in the normal feedback for the next model request. A mode header is not a new HTTP request or SSE connection.
+
+Recognize whole-response commands only as the exact command with zero or one final LF/CRLF; do not use unrestricted whitespace trimming. Mode selection and final answers are explicitly first-line-header forms. Do not extract commands from arbitrary later source lines, strings, Markdown, or fenced blocks. Support at most one mode-selection header and one action per response, not multiple embedded command/action blocks.
 
 ### Action payloads and literal escaping
 
 In an active mode, an ordinary assistant response is one action payload and the mode stays active afterward. For Bash, PowerShell, and Python, use the entire completed text as source, with no JSON wrapper, Markdown fence, or mandatory payload sentinel. The API response boundary delimits the action.
+
+For a combined mode-selection/action response, remove exactly the mode header and its first LF/CRLF separator. Everything remaining is literal action payload for the selected mode, preserving all whitespace and line endings. Do not reclassify that remainder as another control command or decode an additional literal-prefix header inside it. Plain subsequent actions in the current mode need no mode header.
 
 No reserved marker can be guaranteed absent from arbitrary literal content. Use an optional literal-prefix escape in active modes:
 
@@ -175,9 +188,9 @@ Examples:
 - Python `print("@@tau exit")` is ordinary source, not an exit.
 - To submit literal payload `@@tau exit`, send `@@tau literal` on its own first line followed by that payload.
 
-Never execute partial streamed text. Displaying raw SSE deltas is diagnostic observation, not incremental code execution. Only classify and execute after a successful completed response; do not execute truncated, cancelled, or failed responses.
+Never execute partial streamed text or commit a mode change from it. Displaying raw SSE deltas is diagnostic observation, not incremental code execution. Only classify, change modes, and execute after a successful completed response; do not execute truncated, cancelled, or failed responses.
 
-After transitions and actions, report the authoritative current mode and remind the model of the allowed next response. The harness owns mode state; do not infer it from the language the generated code appears to use.
+After transitions and actions, report the authoritative current mode and remind the model of the allowed next response. For a combined selection/action, use one feedback message containing both the mode and operation result, not a preliminary acknowledgement turn. The harness owns mode state; do not infer it from the language the generated code appears to use.
 
 ### File-mode payloads
 
@@ -189,7 +202,7 @@ Use simple non-JSON syntax:
 
 Do not trim file contents or replacements. Specify line-ending behavior and whether/when terminal line endings on path-only payloads are structural. Literal escaping is an outer layer, applied before file parsing; it does not replace file-section delimiter escaping. Do not make executable-language payloads follow file-mode syntax.
 
-Protocol errors must be visible and distinguishable from execution errors. Never silently remove fences, repair commands, change modes, or rewrite code to hide a model mistake. Keep mode transitions and their additional model requests visible.
+Protocol errors must be visible and distinguishable from execution errors. Never silently remove fences, repair commands, change modes, or rewrite code to hide a model mistake. Keep mode transitions and any actual extra requests for standalone transitions visible; do not introduce an acknowledgement round trip for combined selection/action responses.
 
 ## Workspace and execution safety
 
@@ -212,7 +225,7 @@ Configure model-request, execution-action, and protocol-recovery limits per user
 
 Use comparable operation feedback in both protocols: operation, success/failure, stdout/stderr or file result, relevant errors, and truncation. Execution errors should normally give the model a chance to recover within the limits. Explain the conversation/process state retained after an interrupted turn before accepting another prompt.
 
-Show lightweight counters for model requests, actions, failures, and modal transitions so the user can see the cost of entry/exit turns. Show provider-reported usage when available; do not call Tau's default zero cost free usage. No aggregate metrics, comparative scorecards, or benchmark machinery are required.
+Show lightweight counters for model requests, actions, failures, and modal transitions so the user can distinguish combined selection/action responses from standalone entry/exit turns and see their actual request costs. Show provider-reported usage when available; do not call Tau's default zero cost free usage. No aggregate metrics, comparative scorecards, or benchmark machinery are required.
 
 ## Tests and acceptance criteria
 
@@ -222,9 +235,9 @@ Cover:
 
 - Browser-login callback/manual-input handling, credential persistence, refresh, and missing/failed authentication without touching the user's real credentials.
 - Native tool calls/result association, malformed arguments, mixed text/calls, and serial action ordering.
-- Mode entry/action/exit/final handling, wrong-state and unknown commands, bounded recovery, and continuation across user prompts.
-- Literal-prefix round trips, nested literal headers, marker strings inside code, SQLite-like `.mode` text, file newline preservation, delimiter collisions, and atomic edit failure.
-- No native declarations in the mode arm, preserved replay metadata, and no execution of partial/failed/cancelled/truncated responses.
+- Combined mode-selection/action responses from control and active modes, direct switching, repeated selection of the current mode, optional header-only transitions, plain subsequent actions, exit/final handling, wrong-state and unknown commands, bounded recovery, and continuation across user prompts. Assert no intermediate acknowledgement request occurs for a combined response.
+- Literal-prefix round trips, nested literal headers, literal control-looking content immediately after a mode header, marker strings inside code, SQLite-like `.mode` text, file newline preservation, delimiter collisions, and atomic edit failure.
+- No native declarations in the mode arm, preserved replay metadata, and no execution or mode-state changes from partial/failed/cancelled/truncated responses.
 - Persistence in installed runtimes, multiline source, stdout/stderr, exceptions, timeout, process death/state loss, cancellation, and descendant cleanup. Missing PowerShell must be clearly reported; test full behavior when `pwsh` is installed.
 - Workspace confinement and separation between independent sessions.
 - Incremental HTTP/SSE display, arbitrary byte/chunk splits and split UTF-8, LF/CRLF and multiline frames, ignored/terminal/heartbeat events, non-SSE bodies, retries, and disconnects. Assert trace output appears before the response finishes and the adapter receives unchanged data.
