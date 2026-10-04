@@ -25,10 +25,15 @@ class WireModel(BaseModel):
     """Strict model with Python field names and Pi-compatible JSON aliases."""
 
     model_config = ConfigDict(
+        # Don't accept unknown fields.
         extra="forbid",
+        # Validate with python snake_case names.
         validate_by_name=True,
+        # Validate with JSON camelCase alias.
         validate_by_alias=True,
+        # Serialize to JSON camelCase.
         serialize_by_alias=True,
+        # camelCase callable to transform name to alias.
         alias_generator=_to_camel,
     )
 
@@ -36,21 +41,52 @@ class WireModel(BaseModel):
 class UsageCost(WireModel):
     """Billed response cost in USD."""
 
+    # Costs are estimated by taking token count + model pricing (if pricing is
+    # available).
+
+    # Input token cost.
     input: float = 0.0
+    # Output token cost.
     output: float = 0.0
+    # Cost for reading from cache.
     cache_read: float = 0.0
+    # Cost for writing to cache.
     cache_write: float = 0.0
+    # input + output + cache_read + cache_write
     total: float = 0.0
 
 
+#  Request:
+#     UserMessage("What is 2 + 2?")
+#
+#   Response:
+#     AssistantMessage("4", usage=Usage(...))
+#
+#   Request:
+#     UserMessage("What is 2 + 2?")
+#     AssistantMessage("4", usage=...)
+#     UserMessage("Multiply that by 3.")
+#
+#   Response:
+#     AssistantMessage("12", usage=Usage(...))
 class Usage(WireModel):
     """Provider-reported token usage for one assistant response."""
 
+    # Token counts are provider-reported, not internally tracked. Not all may
+    # be provided. Provider adapters will take what's provided by the provider
+    # an attempt to normalize to this common token count format.
+
+    # Input tokens count.
     input: int = 0
+    # Output tokens count.
     output: int = 0
+    # Tokens read from cache.
     cache_read: int = 0
+    # Tokens written to cache.
     cache_write: int = 0
+    # Tokens written to cache in the last 1 hour.
     cache_write_1h: int | None = None
+    # Internal reasoning token count.
     reasoning: int | None = None
     total_tokens: int = 0
     cost: UsageCost = UsageCost()
@@ -58,6 +94,7 @@ class Usage(WireModel):
 
 def sum_usage(usages: Iterable[Usage]) -> Usage:
     """Return the field-wise total for one or more provider requests."""
+    # Why the fuck wasn't this a list instead.
     items = tuple(usages)
 
     def optional_total(field: Literal["cache_write_1h", "reasoning"]) -> int | None:
@@ -86,6 +123,7 @@ def sum_usage(usages: Iterable[Usage]) -> Usage:
     )
 
 
+# Each AssistantMessage has a Usage and ResponseTiming associated with it.
 class ResponseTiming(WireModel):
     """Monotonic request durations for one assistant response."""
 
@@ -93,22 +131,52 @@ class ResponseTiming(WireModel):
     total_duration_ms: int = Field(ge=0)
 
 
+# AssistantMessage.content is an ordered list of content blocks:
+#
+#    type AssistantContent = TextContent | ThinkingContent | ToolCall
+#
+#    class AssistantMessage(WireModel):
+#        content: list[AssistantContent] = ...
+#
+# For example:
+#
+#    AssistantMessage(content=[
+#        ThinkingContent(thinking="Let me work this out..."),
+#        TextContent(text="The answer is 42."),
+#    ])
+#
+#  One assistant message can contain multiple blocks:
+#  - TextContent: Answer text.
+#  - ThinkingContent: Provider-exposed thinking, possibly redacted.
+#  - ToolCall: A request to execute a tool.
+#
+#  ImageContent is not allowed in AssistantMessage.content in this model. It
+#  belongs in user messages and tool results—for example, an uploaded image or an
+#  image returned by a file-reading tool.
+
+
 class TextContent(WireModel):
     type: Literal["text"] = "text"
     text: str
+    # text_signature: "This text really came from this model and hasn’t been
+    # edited."
     text_signature: str | None = None
 
 
 class ThinkingContent(WireModel):
     type: Literal["thinking"] = "thinking"
     thinking: str
+    # thinking_signature: "This thinking really came from this model and hasn’t
+    # been edited."
     thinking_signature: str | None = None
     redacted: bool = False
 
 
 class ImageContent(WireModel):
     type: Literal["image"] = "image"
+    # Base64-encoded image bytes.
     data: str
+    # image/jpeg image/png etc.
     mime_type: str
 
 
