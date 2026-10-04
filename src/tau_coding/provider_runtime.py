@@ -11,6 +11,8 @@ from os import environ
 from typing import Protocol
 from weakref import WeakKeyDictionary
 
+import httpx
+
 from tau_agent.provider import ModelProvider
 from tau_ai.anthropic import AnthropicProvider
 from tau_ai.env import AnthropicConfig, OpenAICompatibleConfig, RuntimeProviderAuth
@@ -378,9 +380,11 @@ class OpenAICodexCredentialResolver:
         provider: OpenAICodexProviderConfig,
         *,
         credential_store: FileCredentialStore,
+        client: httpx.AsyncClient | None = None,
     ) -> None:
         self._provider = provider
         self._credential_store = credential_store
+        self._client = client
 
     async def __call__(self) -> OpenAICodexCredentials:
         """Return a valid Codex access token and account id."""
@@ -419,7 +423,11 @@ class OpenAICodexCredentialResolver:
             stored = self._credential_store.get_oauth(credential_name) or credential
             if not oauth_credential_is_expired(stored):
                 return stored
-            refreshed = await refresh_openai_codex_token(stored.refresh)
+            refreshed = (
+                await refresh_openai_codex_token(stored.refresh)
+                if self._client is None
+                else await refresh_openai_codex_token(stored.refresh, client=self._client)
+            )
             if refreshed != stored:
                 self._credential_store.set_oauth(credential_name, refreshed)
         return refreshed

@@ -39,7 +39,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/tau_ai", "src/tau_agent", "src/tau_coding"]
+packages = ["src/tau_ai", "src/tau_agent", "src/tau_coding", "src/mode_experiment"]
 
 [tool.ruff]
 line-length = 100

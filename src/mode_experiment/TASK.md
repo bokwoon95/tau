@@ -25,11 +25,11 @@ uv run python -m mode_experiment run --protocol tools [options]
 uv run python -m mode_experiment run --protocol modes [options]
 ```
 
-`login` signs in to the OpenAI Codex subscription endpoint. `run` starts a plain terminal prompt loop, not a Textual application. Support model selection, reasoning settings, an explicit workspace, execution isolation, and configurable limits. Document defaults and exact runnable commands in a short README.
+`login` signs in to the OpenAI Codex subscription endpoint. `run` starts a plain terminal prompt loop, not a Textual application. Support model selection, reasoning settings, an explicit workspace, local execution, and configurable limits. Do not implement Docker, containers, or another isolation backend. Document defaults and exact runnable commands in a short README.
 
 For each user prompt, the harness makes model requests and executes actions until the assistant finishes its answer or a limit/error interrupts the turn. Then return to the user prompt. Keep the conversation, workspace, active modal state, and interpreter processes for the lifetime of that CLI session. An assistant final answer finishes a turn, **not** the CLI session. EOF ends the session and cleans up resources. Document Ctrl-C behavior for idle input, model streaming, and execution.
 
-Display the workspace path, protocol, model, reasoning configuration, execution boundary, and tracing configuration at startup. Start with an empty temporary workspace by default; allow an explicitly selected workspace without implicitly using the repository or current directory. Explain whether an explicit workspace is modified in place and how temporary artifacts can be retained for inspection.
+Display the workspace path, protocol, model, reasoning configuration, local execution warning, and tracing configuration at startup. Start with an empty temporary workspace by default; allow an explicitly selected workspace without implicitly using the repository or current directory. Explain whether an explicit workspace is modified in place and how temporary artifacts can be retained for inspection.
 
 Add example manual prompts for reading/writing/editing files, retaining language state over multiple actions, and recovering from an execution error. These are usage examples, not an automated task suite or success grader.
 
@@ -56,7 +56,7 @@ Reuse Tau's existing browser OAuth flow, localhost callback, manual authorizatio
 
 Use a `login` subcommand, **not** `/login` or any other slash-command system. Device-code login and additional auth methods are not required. If credentials are absent, `run` should give an actionable instruction to run `login`. Expired credentials should use Tau's existing refresh behavior and persist refreshed credentials correctly.
 
-Authentication and provider requests run on the host. Never pass OAuth credentials into executable processes or mount the credential store inside their isolation environment.
+Authentication and provider requests run on the host. Do not pass OAuth credentials or inherited provider-secret environment variables into executable interpreter processes. Local code can still access host files; do not claim credentials are protected by a sandbox.
 
 ## Live HTTP and SSE tracing
 
@@ -208,16 +208,13 @@ Protocol errors must be visible and distinguishable from execution errors. Never
 
 Constrain direct file operations to the explicitly displayed workspace, including traversal and symlink handling. A workspace directory alone is **not a sandbox**: arbitrary Bash, PowerShell, and Python source can access the host.
 
-Run real model-generated source only in an explicitly configured disposable isolation environment, such as a container with:
+Run persistent Bash, PowerShell, and Python processes locally on the host. Do not add Docker/container setup, mounting, network-isolation flags, or an execution-backend selector. Require explicit local-execution opt-in and show a prominent unsandboxed warning every session.
 
-- No provider credentials or host secrets mounted.
-- No host mounts beyond the selected experiment workspace.
-- Network disabled by default.
-- Resource limits and process/descendant cleanup.
+Executable source can read or modify host files, access host secrets, and use the network regardless of workspace confinement for direct file operations. Sanitize the interpreter environment, but never present that as a security boundary. Use only trusted prompts and a dedicated disposable workspace.
 
-Maintain the persistent language processes inside that boundary; provider requests remain on the host. An unsafe local-development execution option may be provided, but require explicit opt-in and a prominent warning every session. Never present it as sandboxed or choose it automatically when isolation setup fails.
+Apply action timeouts and bounded output, and clean up interpreter process groups and their descendants on session completion or failure. Explicitly document that detached/daemonized processes can escape local process-group cleanup; there is no sandbox guarantee.
 
-Document isolation prerequisites and exact setup/run commands. Missing runtimes or isolation infrastructure must be actionable failures, not hidden fallback behavior.
+Document local runtime prerequisites and exact setup/run commands. Missing Bash/PowerShell runtimes must be actionable failures, not hidden fallback behavior.
 
 ## Limits and feedback
 
@@ -243,7 +240,7 @@ Cover:
 - Incremental HTTP/SSE display, arbitrary byte/chunk splits and split UTF-8, LF/CRLF and multiline frames, ignored/terminal/heartbeat events, non-SSE bodies, retries, and disconnects. Assert trace output appears before the response finishes and the adapter receives unchanged data.
 - Redaction across headers, URLs, JSON/form bodies, SSE, and errors; diagnostic tracing must not leak credentials or add provider calls.
 
-Provide opt-in real-provider smoke instructions: sign in, run a manual conversation in each protocol, observe live SSE, and demonstrate a persistent variable in separate actions. Real-provider smoke runs must be initiated explicitly by the user and use configured isolation or the explicit unsafe-local opt-in. Do not claim they were run without credentials and an actual run.
+Provide opt-in real-provider smoke instructions: sign in, run a manual conversation in each protocol, observe live SSE, and demonstrate a persistent variable in separate actions. Real-provider smoke runs must be initiated explicitly by the user with the explicit local-execution opt-in. Do not claim they were run without credentials and an actual run.
 
 The README must explain login, both manual invocation forms, model/reasoning configuration, protocol/escaping rules, tracing and its limitations, execution safety/prerequisites, missing-runtime behavior, limits/cancellation, and exact offline test commands. Add beginner-friendly implementation notes under `dev-notes/` explaining reuse of Tau's Codex provider and why JSON HTTP transport is separate from model-generated JSON tool arguments.
 
@@ -251,7 +248,7 @@ The README must explain login, both manual invocation forms, model/reasoning con
 
 1. Inspect existing contracts and Codex OAuth/provider helpers; define actions, results, and the manual runner state.
 2. Implement `login`, credential reuse/refresh, and redacted incremental HTTP/SSE tracing with mock-network tests.
-3. Implement shared workspace operations and isolated persistent processes; test them independently.
+3. Implement shared workspace operations and local persistent processes; test them independently.
 4. Implement and test the modal state machine and literal escaping with scripted responses.
 5. Implement the native-tool protocol with scripted responses using the same backend.
 6. Wire the terminal prompt loop, document commands, and make both protocols ready for user-driven Codex smoke runs.
