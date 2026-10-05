@@ -148,7 +148,7 @@ First-line @@tau commands are reserved and case sensitive; do not embed multiple
 In an active mode @@tau literal plus LF/CRLF removes only that prefix and passes
 all remaining text literally. Prefix twice for a payload beginning with that header.
 A mode-selection remainder is already literal and is never reclassified.
-read: one relative path (one optional final LF/CRLF is structural).
+read: one file path (one optional final LF/CRLF is structural).
 write: path, LF/CRLF, then exact content, including empty content.
 edit: path, LF/CRLF, @@tau old line, old text, @@tau new line, new text,
 @@tau end line (optionally one final LF/CRLF). Section text retains its line endings.
@@ -156,15 +156,16 @@ Escape section lines beginning backslash or @@tau with one extra backslash.
 Use the special line \\n (backslash followed by lowercase n) immediately before a
 section delimiter to remove exactly one preceding LF/CRLF from that section;
 it allows matching/replacing text without a terminal newline. Empty new section deletes.
-No whitespace trimming, fence removal, or code repair is performed. File paths
-must be workspace-relative; direct file operations reject symlinks and traversal.
+No whitespace trimming, fence removal, or code repair is performed.
+Relative file paths use the workspace root; file operations are unrestricted host access.
 Recover from execution/protocol errors using the feedback within the turn limits.
 """
 TOOL_PROMPT = """Operate on the experiment workspace using the six native tools.
 Use serial actions; each executable language has an independent persistent process.
 Variables, functions, imports and cwd survive subsequent calls and user prompts.
-Paths for direct file tools must be workspace-relative. Recover from useful error
-feedback. A normal final answer finishes the current user turn, not the session.
+Relative file paths use the workspace root; host file access is unrestricted.
+Recover from useful error feedback. A normal final answer finishes the current user turn,
+not the session.
 """
 
 

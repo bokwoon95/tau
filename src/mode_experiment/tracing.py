@@ -10,6 +10,8 @@ from __future__ import annotations
 import codecs
 import json
 import re
+import ssl
+import sys
 import threading
 import time
 from collections.abc import AsyncIterator, Callable
@@ -28,7 +30,8 @@ from tau_ai.http import create_async_client
 SENSITIVE = re.compile(
     r"^(?:authorization|proxy.authorization|.*(?:token|secret|cookie)|api.?key|access|refresh|"
     r"id_token|authorization_code|code_verifier|code_challenge|state|.*account.*id|account_id|"
-    r"session.?id|.*(?:organization|user).?id|organization|login_hint|email|sub|password)$",
+    r"session.?id|x-codex-turn-state|.*(?:organization|user).?id|organization|login_hint|email|"
+    r"sub|password)$",
     re.I,
 )
 
@@ -159,11 +162,15 @@ class Output:
         self.console = console
         self.file: TextIO | None = None
         if trace_file is not None:
-            # Diagnostic transcript is private by default, including existing files.
+            # POSIX mode is private; Windows files inherit the directory's ACLs.
             import os
 
-            fd = os.open(trace_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-            os.fchmod(fd, 0o600)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            if sys.platform != "win32":
+                flags |= os.O_NOFOLLOW
+            fd = os.open(trace_file, flags, 0o600)
+            if sys.platform != "win32":
+                os.fchmod(fd, 0o600)
             self.file = os.fdopen(fd, "w", encoding="utf-8")
         self.redactor = Redactor()
         self.limit = limit
@@ -359,6 +366,10 @@ class Trace:
         )
 
     def client(self, **kwargs: Any) -> httpx.AsyncClient:
+        if sys.platform == "win32" and "verify" not in kwargs:
+            # httpx defaults to certifi only; Windows may trust local CA roots
+            # (e.g. a network TLS proxy) that are absent from that bundle.
+            kwargs["verify"] = ssl.create_default_context()
         return create_async_client(
             event_hooks={"request": [self.request], "response": [self.response]}, **kwargs
         )
@@ -377,7 +388,13 @@ class Tee(httpx.AsyncByteStream):
     ) -> None:
         self.original, self.record, self.trace = original, record, trace
         self.content_type = response.headers.get("content-type", "")
-        self.sse = "text/event-stream" in self.content_type.lower()
+        self.sse = "text/event-stream" in self.content_type.lower() or (
+            not self.content_type
+            and response.is_success
+            and response.request.url.path.endswith("/responses")
+        )
+        # Codex can omit Content-Type. Its successful /responses endpoint still
+        # streams SSE; require a real completed event, not merely HTTP 200.
         self.frames = Frames(lambda frame: trace.emit_frame(record, frame), trace.frame_limit)
         self.body = bytearray()
         self.truncated = False

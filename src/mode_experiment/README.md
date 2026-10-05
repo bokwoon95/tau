@@ -6,7 +6,7 @@ benchmarks, or graders. A final answer returns to the prompt, not out of the CLI
 
 ## Start
 
-From a Tau checkout, with `uv` and a POSIX host (macOS/Linux):
+From a Tau checkout, with `uv` on Windows, macOS, or Linux:
 
 ```bash
 uv sync
@@ -22,14 +22,18 @@ link yourself. Login saves only `openai-codex` in Tau's existing
 `~/.tau/credentials.json` (or `$TAU_HOME/credentials.json`). Existing credentials
 are reused, expired credentials are refreshed and persisted, and unrelated
 provider settings/credentials are not rewritten. No API-key setup is supported.
+On Windows, the experiment's HTTP client uses system CA trust (including locally
+installed CA roots), with TLS verification enabled. A browser callback success
+page confirms receipt of the code, not a successful HTTPS token exchange.
 
 **Execution is local and UNSANDBOXED.** The opt-in is required every run.
 Generated source can access host files, secrets, and the network. A dedicated
 workspace and sanitized interpreter environment are not a security boundary.
 There is no Docker/container setup. Use trusted prompts and disposable data.
 
-Bash and PowerShell require `bash` and `pwsh` on `PATH`. Python uses the project's
-Python executable. Missing runtimes produce installation guidance; other
+Bash and PowerShell require `bash` and `pwsh` on `PATH`. On Windows use native
+Bash from Git for Windows, not the System32 WSL launcher (the standard Git install
+is detected as a fallback). Python uses the project's Python executable. Missing runtimes produce installation guidance; other
 operations still work. Install missing tools yourself, for example on macOS:
 
 ```bash
@@ -47,11 +51,11 @@ is modified in place and never automatically removed:
 ```bash
 mkdir -p /tmp/tau-manual-workspace
 uv run python -m mode_experiment run --protocol modes --allow-unsafe-local \
-  --workspace /tmp/tau-manual-workspace --model gpt-5.4 \
+  --workspace /tmp/tau-manual-workspace --model gpt-6.1-sol \
   --reasoning medium --reasoning-summary auto --trace-file /tmp/tau-manual.trace
 ```
 
-Defaults: model `gpt-5.4`, reasoning `medium`, summary `auto`, 24 model requests,
+Defaults: model `gpt-6.1-sol`, reasoning `medium`, summary `auto`, 24 model requests,
 24 actions, 4 protocol errors, 300 seconds per user turn, 30 seconds per action,
 16,384 output characters for file reads / bytes per interpreter output channel,
 and 65,536 characters per diagnostic record/frame. Configure with
@@ -81,9 +85,10 @@ Both protocols use exactly the same backend:
 - `bash(code)`, `powershell(code)`, `python(code)`: multiline source in one
   lazy, persistent process per language, not a fresh interpreter per action.
 
-Direct file paths are workspace-relative; traversal, symlinks, nonregular files,
-and hardlinks are rejected. Files/replacements retain LF/CRLF exactly. Executable
-source is unrestricted host code despite these direct-file constraints.
+Relative file paths use the workspace root; absolute paths, parent traversal,
+symlinks, and hardlinks are allowed. Read/write/edit are ordinary host file operations,
+with no confinement or sandboxing. Files retain LF/CRLF exactly. Edits validate the
+match before writing, but writes are not crash-atomic.
 
 Variables, functions, imports, and interpreter cwd persist across actions, mode
 exits/reentries, and user prompts. Languages and independent CLI sessions have
@@ -169,6 +174,8 @@ secrets or assume a trace is safe to publish.**
 
 A model request is an HTTP POST with a JSON body. Normally its response is a
 long-lived `text/event-stream`, carrying SSE frames with JSON `data` fields.
+Codex can omit `Content-Type`; successful `/responses` responses without that
+header are still parsed as SSE. HTTP 200 alone does not establish completion.
 An SSE frame is **not** a new request or connection. Requests, retries,
 connection reuse, and stream events are different things. Even text-only modes
 use the provider's JSON HTTP envelope: the model generates raw source text;
@@ -191,14 +198,19 @@ rendering does not duplicate every streamed delta.
 
 ## Interruptions and manual smoke prompts
 
-EOF (Ctrl-D on POSIX) or Ctrl-C at idle input ends the session and cleans up
-process groups. Ctrl-C during streaming interrupts only that turn; partial
+Enter submits a prompt; Ctrl+J inserts a newline without submitting. Shift+Enter
+has no separate binding. OAuth fallback input stays hidden and single-line.
+
+EOF (Ctrl-D on POSIX; Ctrl-Z at empty input on Windows) or Ctrl-C at idle input
+ends the session and cleans up processes. Ctrl-C during streaming interrupts only that turn; partial
 output is not executed. During execution it destroys the affected interpreter,
 explicitly reports state loss, and returns to input. Timeout/process death also
 makes that language unavailable for the rest of the session: no silent restart.
 Other live processes, workspace, conversation, and authoritative mode remain.
 Ordinary execution errors allow recovery within the limits. Detached/daemonized
-children can escape local process-group cleanup: there is no containment guarantee.
+children can escape cleanup: there is no containment guarantee. POSIX cleanup uses
+process groups; Windows uses `taskkill.exe /T /F /PID` (best effort, not Job Objects).
+Windows transcript files inherit directory ACLs; store traces in a private directory.
 
 After explicitly signing in, manually run **each** invocation above and try:
 

@@ -1,5 +1,6 @@
 import gzip
 import json
+import os
 from io import StringIO
 
 import httpx
@@ -95,7 +96,8 @@ async def test_live_http_sse_tee_precedes_finish_and_bytes_unchanged(tmp_path):
         assert ": heartbeat" in text and "data: [DONE]" in text
         assert trace.number == 1 and stream.closed
         assert destination.read_text() == text
-        assert destination.stat().st_mode & 0o777 == 0o600
+        if os.name == "posix":
+            assert destination.stat().st_mode & 0o777 == 0o600
     finally:
         output.close()
 
@@ -129,7 +131,8 @@ def sse(event):
 
 
 @pytest.mark.anyio
-async def test_real_adapter_retries_argument_deltas_terminal_and_no_extra_requests():
+@pytest.mark.parametrize("content_type", ["text/event-stream", None])
+async def test_real_adapter_retries_argument_deltas_terminal_and_no_extra_requests(content_type):
     console = StringIO()
     trace = Trace(Output(console))
     events = [
@@ -175,7 +178,9 @@ async def test_real_adapter_retries_argument_deltas_terminal_and_no_extra_reques
         if len(requests) == 1:
             return httpx.Response(503, json={"error": "retry please"})
         return httpx.Response(
-            200, stream=Chunks(events), headers={"content-type": "text/event-stream"}
+            200,
+            stream=Chunks(events),
+            headers={"content-type": content_type} if content_type else {},
         )
 
     async with trace.client(transport=httpx.MockTransport(handler)) as client:
@@ -259,7 +264,8 @@ async def test_redirects_non_sse_form_token_json_and_error_redaction():
 
 
 @pytest.mark.anyio
-async def test_disconnect_no_terminal_completion_and_no_native_trace_substitution():
+@pytest.mark.parametrize("content_type", ["text/event-stream", None])
+async def test_disconnect_no_terminal_completion_and_no_native_trace_substitution(content_type):
     console = StringIO()
     trace = Trace(Output(console))
 
@@ -270,7 +276,7 @@ async def test_disconnect_no_terminal_completion_and_no_native_trace_substitutio
                 [b'data: {"type":"unknown"}\n\n', b"data: unfinished"],
                 error=httpx.ReadError("disconnected"),
             ),
-            headers={"content-type": "text/event-stream"},
+            headers={"content-type": content_type} if content_type else {},
         )
 
     async with trace.client(transport=httpx.MockTransport(handler)) as client:
@@ -295,6 +301,7 @@ async def test_disconnect_no_terminal_completion_and_no_native_trace_substitutio
             ["FORM_SECRET", "REFRESH_SECRET"],
         ),
         ("error https://x/?code=ONE_SECRET", ["ONE_SECRET"]),
+        ("x-codex-turn-state: OPAQUE_SECRET", ["OPAQUE_SECRET"]),
     ],
 )
 def test_redaction_across_errors_urls_json_headers(text, secrets):

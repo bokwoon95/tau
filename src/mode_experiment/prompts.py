@@ -21,7 +21,7 @@ def experiment_prompt(protocol: str, tools: list[AgentTool], workspace: Path) ->
         f"{format_available_tools(tools)}\n\nGuidelines:\n{format_guidelines(tools)}\n\n"
         "LOCAL UNSANDBOXED EXECUTION: source runs on the host and can access host files "
         "and the network. Operate only on the selected workspace; do not access host secrets. "
-        "Direct file paths are relative to the workspace root, independent of interpreter cwd. "
+        "Relative file paths use the workspace root, independent of interpreter cwd. "
         "Bash, PowerShell, and Python have separate persistent state and working directories. "
         "Do not launch a fresh interpreter to emulate one of these operations. "
         "Execution feedback contains only the latest action's output, not a cumulative REPL dump. "

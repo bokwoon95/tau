@@ -43,10 +43,18 @@ async def login(
         )
         store.set_oauth("openai-codex", credential)
         remember_credentials(store, output)
-    except Exception:
+    except httpx.TransportError as exc:
+        # Classify without displaying exception text, which may contain secrets.
+        if "CERTIFICATE_VERIFY_FAILED" in str(exc):
+            detail = "TLS certificate verification failed; check system CA trust"
+        else:
+            detail = f"HTTP transport failure ({type(exc).__name__})"
+        raise RuntimeError(f"Codex login failed: {detail}. Retry login.") from None
+    except Exception as exc:
         # OAuth helper errors can embed arbitrary token endpoint bodies.
         raise RuntimeError(
-            "Codex login failed; check the redacted HTTP trace and retry login."
+            f"Codex login failed ({type(exc).__name__}); "
+            "check the redacted HTTP trace and retry login."
         ) from None
     output.emit("[harness: login] Saved Tau's openai-codex subscription credential.")
 

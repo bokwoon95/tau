@@ -277,6 +277,8 @@ async def test_native_and_modal_same_persistent_backend(tmp_path):
     try:
         tools = {tool.name: tool for tool in backend.tools()}
         assert '"success": true' in (await tools["python"].execute("x", {"code": "x=40"})).text
-        assert (await backend.execute(Action("python", {"code": "print(x+2)"}))).stdout == "42\n"
+        assert (
+            await backend.execute(Action("python", {"code": "print(x+2)"}))
+        ).stdout.splitlines() == ["42"]
     finally:
         await backend.close()

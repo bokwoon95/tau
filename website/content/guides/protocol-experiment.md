@@ -10,8 +10,9 @@ saved conversations, benchmarks, or graders.
 
 ## Run from a checkout
 
-Requires `uv`, a POSIX host, and installed language runtimes (`bash`, optionally
-`pwsh`; Python uses the project environment):
+Requires `uv` on Windows, macOS, or Linux. Bash and PowerShell are optional
+installed runtimes (`bash` and `pwsh`); Python uses the project environment.
+On Windows use Git for Windows Bash, not the System32 WSL launcher:
 
 ```bash
 uv sync
@@ -22,16 +23,23 @@ uv run python -m mode_experiment run --protocol modes --allow-unsafe-local
 
 Login uses Tau's existing browser OAuth and `openai-codex` credential, including
 refresh/persistence and manual redirect fallback. It does not change unrelated
-provider preferences. Default model/reasoning is `gpt-5.4` / `medium`.
+provider preferences. Default model/reasoning is `gpt-6.1-sol` / `medium`.
+Windows HTTPS uses system CA trust with certificate verification enabled; browser
+callback success alone does not confirm that Python's token exchange succeeded.
 
 **Execution is local and unsandboxed.** Generated source can access host files,
-secrets, and the network. Only direct read/write/edit operations are confined to
-the workspace. The explicit opt-in and warning are not a security boundary.
+secrets, and the network. Direct read/write/edit operations are also unrestricted:
+relative paths use the workspace root, but absolute paths, traversal, and links
+are allowed. The explicit opt-in and warning are not a security boundary.
 There is no Docker setup; use trusted prompts and disposable data.
 
 Startup displays a fresh empty temporary workspace by default. Retain it with
 `--keep-workspace`, or modify a dedicated existing directory in place with
 `--workspace /absolute/path`. A final answer returns to input; EOF ends the session.
+Enter submits; Ctrl+J inserts a newline. Shift+Enter has no separate binding.
+Ctrl-C interrupts the active turn, or exits at idle input. Process cleanup uses
+POSIX process groups or Windows `taskkill.exe /T /F /PID`, with no containment
+guarantee. Windows trace files inherit directory ACLs; use a private directory.
 Each language retains its own variables/functions/imports/cwd across actions
 and prompts. Only new action output is returned, but model requests still replay
 the whole conversation. There is no compaction or conversation persistence.
@@ -57,6 +65,8 @@ Live HTTP/SSE tracing is enabled by default; use `--no-trace` to disable it or
 `--trace-file /tmp/tau.trace` for a private diagnostic transcript. This is a
 reconstructed application-level trace, not a packet capture. A POST carries
 JSON; its SSE frames are events within its response, not new HTTP requests.
+Successful Codex streams may omit `Content-Type`; the experiment still observes
+SSE and requires a successful terminal event rather than trusting HTTP 200 alone.
 Text-only modes still use a JSON transport envelope—the model generates raw
 source text, not JSON tool argument strings.
 

@@ -1,6 +1,8 @@
 import asyncio
 import os
 import shutil
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -8,8 +10,25 @@ from mode_experiment.execution import Backend
 from mode_experiment.protocols import Action
 
 
+def process_alive(pid):
+    if os.name == "nt":
+        result = subprocess.run(
+            ["tasklist.exe", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return f'","{pid}",' in result.stdout
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    status = Path(f"/proc/{pid}/stat")
+    return not (status.exists() and status.read_text().split(")", 1)[1].split()[0] == "Z")
+
+
 @pytest.mark.anyio
-async def test_files_confinement_newlines_atomicity(tmp_path):
+async def test_files_newlines_and_edit_validation(tmp_path):
     backend = Backend(tmp_path, output_limit=8)
     try:
         assert (
@@ -30,16 +49,22 @@ async def test_files_confinement_newlines_atomicity(tmp_path):
             )
         ).success
         assert (tmp_path / "dir/file").read_bytes() == b"a\r\na\r\n"
-        (tmp_path / "link").symlink_to(tmp_path.parent)
-        (tmp_path / "filelink").symlink_to(tmp_path / "dir/file")
+        # Absolute paths and parent traversal intentionally remain unrestricted.
+        for path in (str(tmp_path.parent / "outside.txt"), "../outside.txt"):
+            assert (
+                await backend.execute(Action("write", {"path": path, "content": "host"}))
+            ).success
+            assert (await backend.execute(Action("read", {"path": path}))).stdout == "host"
+            assert (
+                await backend.execute(
+                    Action("edit", {"path": path, "old_text": "host", "new_text": "changed"})
+                )
+            ).success
         os.link(tmp_path / "dir/file", tmp_path / "hardlink")
-        for path in ("../escape", "/etc/passwd", "link/escape", "filelink", "hardlink", "./bad"):
-            for name, args in (
-                ("read", {}),
-                ("write", {"content": "evil"}),
-                ("edit", {"old_text": "a", "new_text": "b"}),
-            ):
-                assert not (await backend.execute(Action(name, {"path": path, **args}))).success
+        assert (
+            await backend.execute(Action("write", {"path": "hardlink", "content": "linked"}))
+        ).success
+        assert (tmp_path / "dir/file").read_text() == "linked"
         assert not (await backend.execute(Action("write", {"path": "x", "content": 1}))).success
         assert not (await backend.execute(Action("wat", {}))).success
     finally:
@@ -87,7 +112,9 @@ async def test_persistent_multiline_errors_and_independent_sessions(
         process = backend.processes[language].process
         result = await backend.execute(Action(language, {"code": second}))
         assert result.success and "42" in result.stdout, result.text()
-        if language != "python":
+        if language == "bash" and os.name == "nt":
+            assert result.stdout.strip().endswith("/sub")
+        elif language != "python":
             assert str(tmp_path / "sub") in result.stdout
         assert backend.processes[language].process is process
         assert not (await backend.execute(Action(language, {"code": error}))).success
@@ -113,8 +140,8 @@ async def test_persistent_multiline_errors_and_independent_sessions(
     ],
 )
 async def test_death_never_silently_restarts(tmp_path, language, code):
-    if language == "powershell" and not shutil.which("pwsh"):
-        pytest.skip("pwsh unavailable")
+    if language != "python" and not shutil.which("pwsh" if language == "powershell" else "bash"):
+        pytest.skip("runtime unavailable")
     backend = Backend(tmp_path)
     try:
         result = await backend.execute(Action(language, {"code": code}))
@@ -127,14 +154,21 @@ async def test_death_never_silently_restarts(tmp_path, language, code):
 
 @pytest.mark.anyio
 async def test_timeout_cancel_output_and_descendants(tmp_path):
-    backend = Backend(tmp_path, timeout=0.15, output_limit=32)
+    backend = Backend(tmp_path, timeout=1, output_limit=32)
     try:
         result = await backend.execute(Action("python", {"code": "print('x'*1000)"}))
         assert result.success and result.truncated and len(result.stdout) == 32
         result = await backend.execute(Action("python", {"code": "import time; time.sleep(10)"}))
         assert not result.success and result.state_lost and "timeout" in result.error
-        code = "sleep 30 &\necho $! > descendant.pid\nwait"
-        task = asyncio.create_task(backend.execute(Action("bash", {"code": code})))
+        code = (
+            "import subprocess, sys, pathlib, time\n"
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+            "pathlib.Path('descendant.pid').write_text(str(child.pid))\n"
+            "time.sleep(30)"
+        )
+        # Use a separate backend: timed-out interpreters must never restart.
+        cancelled = Backend(tmp_path)
+        task = asyncio.create_task(cancelled.execute(Action("python", {"code": code})))
         for _ in range(100):
             if (tmp_path / "descendant.pid").exists():
                 break
@@ -144,15 +178,32 @@ async def test_timeout_cancel_output_and_descendants(tmp_path):
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        assert backend.processes["bash"].dead
+        assert cancelled.processes["python"].dead
+        await cancelled.close()
         for _ in range(100):
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
+            if not process_alive(pid):
                 break
             await asyncio.sleep(0.01)
         else:
             pytest.fail("descendant survived cancellation")
+    finally:
+        await backend.close()
+
+
+@pytest.mark.anyio
+async def test_large_output_is_bounded_and_not_replayed(tmp_path):
+    backend = Backend(tmp_path, output_limit=32)
+    try:
+        result = await backend.execute(
+            Action(
+                "python",
+                {"code": ("import sys\nprint('x'*1000000)\nprint('y'*1000000, file=sys.stderr)")},
+            )
+        )
+        assert result.success and result.truncated
+        assert result.stdout == "x" * 32 and result.stderr == "y" * 32
+        result = await backend.execute(Action("python", {"code": "print('next')"}))
+        assert result.success and result.stdout.splitlines() == ["next"] and not result.stderr
     finally:
         await backend.close()
 

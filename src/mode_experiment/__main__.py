@@ -2,12 +2,15 @@
 
 import argparse
 import asyncio
+import codecs
 import os
+import queue
 import signal
 import sys
 import tempfile
-import termios
+import threading
 from contextlib import suppress
+from importlib import import_module
 from pathlib import Path
 
 from mode_experiment.authentication import credential_resolver, login
@@ -19,25 +22,131 @@ from tau_coding.credentials import FileCredentialStore
 
 
 class Terminal:
-    """Cancellable POSIX stdin reader; no blocked input thread on EOF/callback."""
+    """Cancellable terminal input; redirected Windows input uses a daemon reader."""
 
     def __init__(self, output: Output) -> None:
         self.output = output
         self.buffer = bytearray()
         self.eof = False
+        self.lines: queue.Queue[str] | None = None
+
+    def input_key(self, chars: list[str], char: str, *, secret: bool) -> str | None:
+        if char == "\x03":
+            raise asyncio.CancelledError
+        if char in ("\x04", "\x1a") and not chars:
+            self.eof = True
+            raise EOFError
+        if char == "\r" or (char == "\n" and secret):
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            return "".join(chars)
+        if char in ("\b", "\x7f"):
+            if chars:
+                removed = chars.pop()
+                if not secret:
+                    if removed == "\n":
+                        column = len("".join(chars).rsplit("\n", 1)[-1]) + 1
+                        sys.stdout.write(f"\x1b[1A\x1b[{column}G")
+                    else:
+                        sys.stdout.write("\b \b")
+        elif char == "\n" or char == "\t" or char.isprintable():
+            chars.append(char)
+            if not secret:
+                sys.stdout.write(char)
+        sys.stdout.flush()
+        return None
+
+    async def windows_readline(self, *, secret: bool) -> str:
+        if not sys.stdin.isatty():
+            if self.lines is None:
+                self.lines = queue.Queue()
+
+                def read_lines() -> None:
+                    assert self.lines is not None
+                    for line in sys.stdin:
+                        self.lines.put(line)
+                    self.lines.put("")
+
+                threading.Thread(target=read_lines, daemon=True).start()
+            while self.lines.empty():
+                await asyncio.sleep(0.02)
+            line = self.lines.get_nowait()
+            if not line:
+                self.eof = True
+                raise EOFError
+            return line.removesuffix("\n").removesuffix("\r")
+        msvcrt = import_module("msvcrt")
+
+        chars: list[str] = []
+        extended = False
+        while True:
+            if not msvcrt.kbhit():
+                await asyncio.sleep(0.02)
+                continue
+            char = msvcrt.getwch()
+            if extended:
+                extended = False
+                continue
+            if char in ("\x00", "\xe0"):
+                extended = True
+            else:
+                result = self.input_key(chars, char, secret=secret)
+                if result is not None:
+                    return result
 
     async def readline(self, prompt: str, *, secret: bool = False) -> str:
         self.output.emit("[harness: input] " + prompt)
+        if self.eof and not self.buffer:
+            raise EOFError
+        if sys.platform == "win32":
+            return await self.windows_readline(secret=secret)
+        termios = import_module("termios")
         loop = asyncio.get_running_loop()
         fd = sys.stdin.fileno()
         attributes = None
-        if secret and os.isatty(fd):
+        interactive = os.isatty(fd)
+        if interactive:
             attributes = termios.tcgetattr(fd)
             hidden = list(attributes)
-            hidden[3] &= ~termios.ECHO
+            hidden[6] = list(attributes[6])
+            # Preserve SIGINT, but distinguish Enter (CR) from Ctrl-J (LF).
+            hidden[0] &= ~(termios.ICRNL | termios.INLCR | termios.IGNCR)
+            hidden[3] &= ~(termios.ECHO | termios.ECHONL | termios.ICANON)
+            hidden[6][termios.VMIN] = 1
+            hidden[6][termios.VTIME] = 0
             termios.tcsetattr(fd, termios.TCSANOW, hidden)
+        chars: list[str] = []
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        escape = ""
         try:
-            while b"\n" not in self.buffer and not self.eof:
+            while True:
+                if interactive and self.buffer:
+                    # Consume only through submission; keep typeahead for next input.
+                    byte = bytes(self.buffer[:1])
+                    del self.buffer[:1]
+                    for char in decoder.decode(byte):
+                        if char == "\x1b":
+                            escape = char
+                            continue
+                        if escape:
+                            escape += char
+                            if (len(escape) > 2 and (char.isalpha() or char == "~")) or (
+                                len(escape) == 2 and char not in "[O"
+                            ):
+                                escape = ""
+                            continue
+                        result = self.input_key(chars, char, secret=secret)
+                        if result is not None:
+                            return result
+                    continue
+                if not interactive and b"\n" in self.buffer:
+                    break
+                if self.eof:
+                    if interactive:
+                        if chars:
+                            return "".join(chars)
+                        raise EOFError
+                    break
                 ready = loop.create_future()
 
                 def consume(ready: asyncio.Future[None] = ready) -> None:
@@ -103,7 +212,7 @@ def parser() -> argparse.ArgumentParser:
             sub.add_argument("--no-browser", action="store_true")
             continue
         sub.add_argument("--protocol", required=True, choices=("tools", "modes"))
-        sub.add_argument("--model", default="gpt-5.4")
+        sub.add_argument("--model", default="gpt-6.1-sol")
         sub.add_argument(
             "--reasoning",
             choices=("default", "none", "minimal", "low", "medium", "high", "xhigh"),
@@ -160,7 +269,11 @@ async def main_async(args: argparse.Namespace) -> int:
             current.cancel()
 
     loop = asyncio.get_running_loop()
-    loop.add_signal_handler(signal.SIGINT, interrupt)
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    if os.name == "nt":
+        signal.signal(signal.SIGINT, lambda *_: loop.call_soon_threadsafe(interrupt))
+    else:
+        loop.add_signal_handler(signal.SIGINT, interrupt)
     workspace = None
     temporary = None
     backend = None
@@ -195,11 +308,6 @@ async def main_async(args: argparse.Namespace) -> int:
                 workspace = args.workspace.expanduser().resolve(strict=True)
                 if not workspace.is_dir():
                     raise RuntimeError("--workspace must be an existing directory")
-            if store.path.resolve().is_relative_to(workspace):
-                raise RuntimeError(
-                    "Workspace would expose the credential store; "
-                    "select a dedicated non-secret directory"
-                )
             output.emit(
                 "[harness: WARNING] UNSAFE LOCAL EXECUTION: generated code can read/modify "
                 "the host, access host secrets, and use the network. NOT SANDBOXED."
@@ -253,7 +361,7 @@ async def main_async(args: argparse.Namespace) -> int:
                 completed=trace.completed,
             )
             while True:
-                prompt = await terminal.readline("Prompt (EOF ends session):")
+                prompt = await terminal.readline("Prompt (Enter sends; Ctrl+J newline; EOF exits):")
                 if not prompt:
                     continue
                 active = asyncio.create_task(runner.turn(prompt))
@@ -270,7 +378,9 @@ async def main_async(args: argparse.Namespace) -> int:
         output.emit(f"[harness: failure] {exc}")
         return 1
     finally:
-        loop.remove_signal_handler(signal.SIGINT)
+        if os.name != "nt":
+            loop.remove_signal_handler(signal.SIGINT)
+        signal.signal(signal.SIGINT, previous_sigint)
         if provider is not None:
             await provider.aclose()
         if backend is not None:
@@ -287,10 +397,6 @@ async def main_async(args: argparse.Namespace) -> int:
 
 def main() -> None:
     args = parser().parse_args()
-    if os.name != "posix":
-        parser().error(
-            "This experiment requires a POSIX host; PowerShell runs via pwsh inside that boundary."
-        )
     with suppress(KeyboardInterrupt):
         raise SystemExit(asyncio.run(main_async(args)))
 

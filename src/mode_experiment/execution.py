@@ -1,6 +1,6 @@
 """Shared workspace operations and lazy, persistent LOCAL language processes.
 
-Direct file operations are confined. Executable source is NOT sandboxed.
+All operations are unrestricted host operations, NOT sandboxed.
 """
 
 from __future__ import annotations
@@ -9,11 +9,10 @@ import asyncio
 import json
 import os
 import signal
-import stat
+import subprocess
 import sys
-import uuid
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager, suppress
+from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import cast
@@ -40,83 +39,36 @@ class Result:
 
 
 class Workspace:
-    """POSIX descriptor-relative operations; never follow symlinks, including races."""
+    """Ordinary host files; relative paths default to the workspace, not confinement."""
 
     def __init__(self, path: Path, limit: int) -> None:
         self.path = path.resolve(strict=True)
         self.limit = limit
-        self.root = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY)
-
-    def close(self) -> None:
-        os.close(self.root)
-
-    @contextmanager
-    def parent(self, path: str, create: bool = False) -> Iterator[tuple[int, str]]:
-        parts = path.split("/")
-        if not path or any(part in ("", ".", "..") for part in parts) or "\x00" in path:
-            raise ValueError(
-                "path must be relative, nonempty, with no '.', '..', or empty components"
-            )
-        fd = os.dup(self.root)
-        try:
-            for part in parts[:-1]:
-                if create:
-                    with suppress(FileExistsError):
-                        os.mkdir(part, dir_fd=fd)
-                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-                os.close(fd)
-                fd = child
-            yield fd, parts[-1]
-        finally:
-            os.close(fd)
-
-    def existing(self, fd: int, name: str) -> int:
-        handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
-        info = os.fstat(handle)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-            os.close(handle)
-            raise ValueError("only regular, non-hardlinked files are supported; symlinks forbidden")
-        return handle
-
-    def replace(self, fd: int, name: str, text: str) -> None:
-        try:
-            handle = self.existing(fd, name)
-        except FileNotFoundError:
-            pass
-        else:
-            os.close(handle)
-        temporary = f".tau-{uuid.uuid4().hex}"
-        try:
-            handle = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=fd)
-            with os.fdopen(handle, "w", encoding="utf-8", newline="") as stream:
-                stream.write(text)
-            os.replace(temporary, name, src_dir_fd=fd, dst_dir_fd=fd)
-        finally:
-            with suppress(FileNotFoundError):
-                os.unlink(temporary, dir_fd=fd)
 
     def execute(self, operation: str, args: Mapping[str, str]) -> Result:
-        with self.parent(args["path"], create=operation == "write") as (fd, name):
-            if operation == "write":
-                self.replace(fd, name, args["content"])
+        path = self.path / args["path"]
+        if operation == "write":
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", encoding="utf-8", newline="") as stream:
+                stream.write(args["content"])
+            return Result(
+                operation, True, stdout=f"wrote {len(args['content'].encode('utf-8'))} bytes"
+            )
+        with path.open("r", encoding="utf-8", newline="") as stream:
+            if operation == "read":
+                text = stream.read(self.limit + 1)
                 return Result(
-                    operation, True, stdout=f"wrote {len(args['content'].encode('utf-8'))} bytes"
+                    operation, True, stdout=text[: self.limit], truncated=len(text) > self.limit
                 )
-            with os.fdopen(self.existing(fd, name), "r", encoding="utf-8", newline="") as stream:
-                if operation == "read":
-                    text = stream.read(self.limit + 1)
-                    return Result(
-                        operation, True, stdout=text[: self.limit], truncated=len(text) > self.limit
-                    )
-                # Edits are computed against the original file, never a truncated read.
-                text = stream.read()
-            old, new = args["old_text"], args["new_text"]
-            if not old or text.find(old) < 0 or text.find(old) != text.rfind(old):
-                raise ValueError(
-                    "edit requires nonempty old_text matching exactly once; file unchanged"
-                )
-            self.replace(fd, name, text.replace(old, new, 1))
-            return Result(operation, True, stdout="replaced exactly one match")
+            text = stream.read()
+        old, new = args["old_text"], args["new_text"]
+        if not old or text.find(old) < 0 or text.find(old) != text.rfind(old):
+            raise ValueError(
+                "edit requires nonempty old_text matching exactly once; file unchanged"
+            )
+        with path.open("w", encoding="utf-8", newline="") as stream:
+            stream.write(text.replace(old, new, 1))
+        return Result(operation, True, stdout="replaced exactly one match")
 
 
 class LanguageProcess:
@@ -138,7 +90,13 @@ class LanguageProcess:
             "HOME": "/tmp",
             "LANG": "C.UTF-8",
             "TERM": "dumb",
+            "PYTHONIOENCODING": "utf-8",
         }
+        if os.name == "nt":
+            for name in ("SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP"):
+                if name in os.environ:
+                    env[name] = os.environ[name]
+            env.pop("HOME")
         self.process = await asyncio.create_subprocess_exec(
             *argv,
             cwd=self.workspace,
@@ -146,7 +104,7 @@ class LanguageProcess:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
+            start_new_session=os.name == "posix",
             limit=max(65536, self.output_limit * 16 + 8192),
         )
         assert self.process.stdout is not None and self.process.stderr is not None
@@ -213,14 +171,27 @@ class LanguageProcess:
     async def close(self) -> None:
         self.dead = True
         if self.process is not None:
-            # TERM lets the supervisor kill its child's process group and reap it.
-            with suppress(ProcessLookupError):
-                os.killpg(self.process.pid, signal.SIGTERM)
+            if sys.platform == "win32":
+                if self.process.returncode is None:
+                    await asyncio.to_thread(
+                        subprocess.run,
+                        ["taskkill.exe", "/T", "/F", "/PID", str(self.process.pid)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                    )
+            else:
+                # TERM lets the supervisor kill its child's group and reap it.
+                with suppress(ProcessLookupError):
+                    os.killpg(self.process.pid, signal.SIGTERM)
             try:
                 await asyncio.wait_for(self.process.wait(), 2)
             except TimeoutError:
                 with suppress(ProcessLookupError):
-                    os.killpg(self.process.pid, signal.SIGKILL)
+                    if sys.platform == "win32":
+                        self.process.kill()
+                    else:
+                        os.killpg(self.process.pid, signal.SIGKILL)
                 await self.process.wait()
 
 
@@ -256,12 +227,13 @@ class Backend:
         for process in self.processes.values():
             if process.process is not None:
                 await process.close()
-        self.workspace.close()
 
     def tools(self) -> list[AgentTool]:
         descriptions = {
-            "read": "Read a workspace-relative UTF-8 file, with bounded output; no symlinks.",
-            "write": "Create/overwrite a UTF-8 file and parent directories within the workspace.",
+            "read": "Read a host UTF-8 file with bounded output; relative paths use the workspace.",
+            "write": (
+                "Create/overwrite a host UTF-8 file and parents; relative paths use the workspace."
+            ),
             "edit": (
                 "Replace exactly one nonempty old_text match with new_text; "
                 "ambiguous edits fail atomically."
