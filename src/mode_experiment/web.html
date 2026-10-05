@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mode experiment</title>
+  <style>
+    * { box-sizing: border-box; }
+    body, button, textarea { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    body { margin: 0; background: #f6f6f4; color: #222; font-size: 14px; }
+    header { padding: 16px 20px; border-bottom: 1px solid #bbb; background: #fff; }
+    .header-heading { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+    h1 { margin: 0; font-size: 18px; }
+    #info, #status { overflow-wrap: anywhere; color: #555; margin: 6px 0; }
+    .warning { color: #8b3100; font-size: 12px; }
+    main { max-width: 1000px; margin: auto; padding: 20px 16px 220px; }
+    #empty { color: #666; }
+    .bubble { padding: 12px 16px; border: 1px solid #bbb; border-radius: 8px; margin: 16px 0; }
+    .bubble.user { margin-left: 12%; background: #e9f0fc; }
+    .bubble.assistant { margin-right: 12%; background: #fff; }
+    .label { color: #555; font-size: 12px; margin-bottom: 8px; }
+    .bubble-heading { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+    .copy-button { padding: 2px 6px; margin-left: 8px; font-size: 12px; }
+    .message { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; }
+    details { margin: 6px 0; border: 1px solid #ccc; background: #fafafa; border-radius: 4px; }
+    summary { padding: 8px 10px; cursor: pointer; color: #555; overflow-wrap: anywhere; font-size: 12px; }
+    details[open] summary { border-bottom: 1px solid #ddd; }
+    .sse-events { padding: 0 10px 6px; }
+    .selected { outline: 2px solid #315fcc; outline-offset: 1px; }
+    .bubble.selected, details.selected > summary { background: #dfe9ff; }
+    pre { margin: 0; padding: 12px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; line-height: 1.4; }
+    #composer { position: fixed; bottom: 0; width: 100%; background: #fff; border-top: 1px solid #bbb; padding: 12px 16px; }
+    form { max-width: 968px; margin: auto; }
+    textarea { width: 100%; height: 90px; resize: vertical; max-height: 40vh; padding: 10px; border: 1px solid #999; font-size: 14px; }
+    .controls { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+    #copy-selected { margin-left: auto; flex-shrink: 0; }
+    button { padding: 6px 12px; cursor: pointer; }
+    button:disabled { cursor: default; }
+    .hint { color: #666; font-size: 12px; }
+    #error { color: #a21c1c; white-space: pre-wrap; margin-top: 6px; }
+    #token-status { margin-top: 8px; color: #555; font-size: 12px; overflow-wrap: anywhere; }
+    #token-status[data-pressure="high"] { color: #8b3100; }
+    #token-status[data-pressure="critical"] { color: #a21c1c; }
+    @media (max-width: 600px) {
+      .bubble.user { margin-left: 4%; }
+      .bubble.assistant { margin-right: 4%; }
+      .hint { font-size: 10px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-heading">
+      <h1>Mode experiment</h1>
+      <button id="copy-all" type="button" disabled>Copy All</button>
+    </div>
+    <div id="info">Connecting…</div>
+    <div id="status" role="status">Waiting for server</div>
+    <div class="warning">UNSANDBOXED: the agent can modify host files and access secrets/network. Keep this page and URL private.</div>
+  </header>
+  <main id="timeline">
+    <p id="empty">Send a prompt. HTTP, SSE, tools, and mode payloads appear here in order, collapsed by default.</p>
+  </main>
+  <div id="composer">
+    <form id="form">
+      <label for="prompt" class="hint">Prompt</label>
+      <textarea id="prompt" placeholder="Talk to the agent…" autofocus></textarea>
+      <div class="controls">
+        <button id="send" type="submit" disabled>Send</button>
+        <button id="cancel" type="button" disabled>Interrupt</button>
+        <span class="hint">Enter sends · Shift+Enter newline</span>
+        <button id="copy-selected" type="button" disabled title="Ctrl-click toggles selection; Shift-click selects a visible range">Copy Selected</button>
+      </div>
+      <div id="token-status" aria-label="Token and cache statistics">↑0 ↓0 R0 CH— · context unknown</div>
+      <div id="error" role="alert"></div>
+    </form>
+  </div>
+  <script>
+    const token = new URLSearchParams(location.search).get('token') || '';
+    const endpoint = (path) => `${path}?token=${encodeURIComponent(token)}`;
+    const timeline = document.getElementById('timeline');
+    const prompt = document.getElementById('prompt');
+    const send = document.getElementById('send');
+    const cancel = document.getElementById('cancel');
+    const status = document.getElementById('status');
+    const error = document.getElementById('error');
+    const tokenStatus = document.getElementById('token-status');
+    let busy = false;
+    let connected = false;
+    let submitting = false;
+    let mode = null;
+    let lastId = 0;
+    const sseGroups = new Map();
+    const chatRecords = [];
+    const copyAll = document.getElementById('copy-all');
+    const copySelected = document.getElementById('copy-selected');
+    const selectable = new Map();
+    const selected = new Set();
+    let selectionAnchor = null;
+
+    function makeSelectable(element, getRecords) {
+      element.dataset.selectable = 'true';
+      element.setAttribute('aria-description', 'Ctrl-click toggles selection; Shift-click selects a range.');
+      selectable.set(element, getRecords);
+    }
+
+    function selectedRecords() {
+      const records = new Set();
+      for (const element of selected) {
+        for (const record of selectable.get(element)()) records.add(record);
+      }
+      return chatRecords.filter((record) => records.has(record));
+    }
+
+    function updateSelection() {
+      if (copySelected.dataset.copying) return;
+      const count = selectedRecords().length;
+      copySelected.disabled = count === 0;
+      copySelected.textContent = count ? `Copy Selected (${count})` : 'Copy Selected';
+    }
+
+    function isVisible(element) {
+      for (let parent = element.parentElement; parent && parent !== timeline; parent = parent.parentElement) {
+        if (parent.tagName === 'DETAILS' && !parent.open) return false;
+      }
+      return true;
+    }
+
+    function selectionTarget(event) {
+      if (!(event.ctrlKey || event.metaKey || event.shiftKey) || event.target.closest('button')) return null;
+      return event.target.closest('[data-selectable]');
+    }
+
+    timeline.addEventListener('mousedown', (event) => {
+      if (event.button === 0 && selectionTarget(event)) event.preventDefault();
+    });
+
+    timeline.addEventListener('click', (event) => {
+      const element = selectionTarget(event);
+      if (!element) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.shiftKey && selectionAnchor) {
+        const visible = [...timeline.querySelectorAll('[data-selectable]')].filter(isVisible);
+        const start = visible.indexOf(selectionAnchor);
+        const end = visible.indexOf(element);
+        const range = start < 0 ? [element] : visible.slice(Math.min(start, end), Math.max(start, end) + 1);
+        for (const item of range) selected.add(item);
+      } else {
+        if (selected.has(element)) selected.delete(element);
+        else selected.add(element);
+        selectionAnchor = element;
+      }
+      for (const item of selectable.keys()) item.classList.toggle('selected', selected.has(item));
+      updateSelection();
+    }, true);
+
+    function shortTokens(value) {
+      if (value >= 1000000) return `${Number((value / 1000000).toFixed(1))}M`;
+      if (value >= 1000) return `${Number((value / 1000).toFixed(value < 10000 ? 1 : 0))}k`;
+      return String(value);
+    }
+
+    function showStatistics(stats) {
+      if (!stats) return;
+      const partial = stats.reported_requests < stats.completed_requests;
+      const unknown = stats.completed_requests > 0 && stats.reported_requests === 0;
+      const tokens = (value) => unknown ? '?' : `${partial ? '≥' : ''}${shortTokens(value || 0)}`;
+      const hit = stats.cache_hit_percent == null ? '—' : `${stats.cache_hit_percent.toFixed(1)}%`;
+      const context = stats.context_tokens || 0;
+      const window = stats.context_window;
+      const percent = window ? context / window * 100 : null;
+      const filled = percent == null ? `~${shortTokens(context)}/?` : `~${percent.toFixed(1)}%/${shortTokens(window)}`;
+      const writes = stats.cache_write ? ` W${tokens(stats.cache_write)}` : '';
+      tokenStatus.textContent = `↑${tokens(stats.input)} ↓${tokens(stats.output)} R${tokens(stats.cache_read)}${writes} CH${hit} ${filled}`;
+      tokenStatus.dataset.pressure = percent >= 95 ? 'critical' : percent >= 80 ? 'high' : 'normal';
+      tokenStatus.title = [
+        `Session totals: fresh input ${stats.input || 0}, output ${stats.output || 0}, cache read ${stats.cache_read || 0}, cache write ${stats.cache_write || 0}.`,
+        'CH = cache reads / all input tokens across reported responses (weighted, not an average of percentages).',
+        `${stats.reported_requests || 0}/${stats.completed_requests || 0} completed responses reported token usage; missing usage is not counted.`,
+        `Current context estimate: ${context} tokens / ${window || 'unknown'} token window.`,
+        stats.context_provider_anchored ? 'Context uses the latest provider usage plus estimated trailing messages.' : 'Context is estimated from text/schema sizes; no provider usage anchor yet.',
+        'This experiment has no automatic compaction. Use --context-window to supply an unknown window, or --discover-models to query model limits.'
+      ].join('\n');
+    }
+
+    function recordText(record) {
+      const label = record.kind === 'user' ? 'You' : record.kind === 'assistant' ? 'Assistant' : record.summary;
+      return `${record.id ? `#${record.id} · ` : ''}${label}\n\n${record.body}`;
+    }
+
+    function fallbackCopy(text) {
+      const focused = document.activeElement;
+      const selection = focused instanceof HTMLTextAreaElement ? [focused.selectionStart, focused.selectionEnd] : null;
+      const field = document.createElement('textarea');
+      field.value = text;
+      field.style.position = 'fixed';
+      field.style.opacity = '0';
+      field.setAttribute('aria-hidden', 'true');
+      document.body.append(field);
+      try {
+        field.select();
+        if (!document.execCommand('copy')) throw new Error('Clipboard copy was blocked by the browser.');
+      } finally {
+        field.remove();
+        focused?.focus?.();
+        if (selection) focused.setSelectionRange(...selection);
+      }
+    }
+
+    async function copyText(button, text) {
+      const label = button.textContent;
+      button.disabled = true;
+      button.dataset.copying = 'true';
+      error.textContent = '';
+      try {
+        try {
+          if (!navigator.clipboard?.writeText) throw new Error('Clipboard API unavailable');
+          await navigator.clipboard.writeText(text);
+        } catch (_) {
+          fallbackCopy(text);
+        }
+        button.textContent = 'Copied!';
+      } catch (exception) {
+        button.textContent = 'Copy failed';
+        error.textContent = exception.message;
+      } finally {
+        setTimeout(() => {
+          button.textContent = label;
+          delete button.dataset.copying;
+          button.disabled = false;
+          if (button === copySelected) updateSelection();
+        }, 1500);
+      }
+    }
+
+    function copyButton(getText, label = 'Copy') {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'copy-button';
+      button.textContent = label;
+      button.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        copyText(button, getText());
+      });
+      return button;
+    }
+
+    copyAll.addEventListener('click', () => {
+      copyText(copyAll, chatRecords.map(recordText).join('\n\n---\n\n'));
+    });
+
+    copySelected.addEventListener('click', () => {
+      const records = selectedRecords();
+      if (records.length) copyText(copySelected, records.map(recordText).join('\n\n---\n\n'));
+    });
+
+    function controls() {
+      send.disabled = !connected || busy || submitting;
+      cancel.disabled = !connected || !busy;
+      status.textContent = `${connected ? (busy ? 'Agent working' : 'Ready') : 'Disconnected / reconnecting'} · mode: ${mode || 'control'}`;
+    }
+
+    async function request(path, options = {}) {
+      const response = await fetch(endpoint(path), options);
+      if (!response.ok) {
+        let detail = `HTTP ${response.status}`;
+        try {
+          const body = await response.json();
+          detail += `: ${typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail, null, 2)}`;
+        } catch (_) {}
+        throw new Error(detail);
+      }
+      return response.json();
+    }
+
+    function render(record) {
+      if (record.kind === 'statistics') {
+        showStatistics(record.statistics);
+        return;
+      }
+      if (record.kind === 'status') {
+        busy = record.busy;
+        if ('mode' in record) mode = record.mode;
+        controls();
+        return;
+      }
+      chatRecords.push(record);
+      if (!copyAll.dataset.copying) copyAll.disabled = false;
+      document.getElementById('empty')?.remove();
+      const nearBottom = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 100;
+      let element;
+      if (record.kind === 'user' || record.kind === 'assistant') {
+        element = document.createElement('section');
+        element.className = `bubble ${record.kind}`;
+        const label = document.createElement('div');
+        label.className = 'label';
+        label.classList.add('bubble-heading');
+        const name = document.createElement('span');
+        name.textContent = record.kind === 'user' ? 'You' : 'Assistant';
+        label.append(name, copyButton(() => record.body));
+        const message = document.createElement('div');
+        message.className = 'message';
+        message.textContent = record.body;
+        element.append(label, message);
+      } else {
+        element = document.createElement('details');
+        const summary = document.createElement('summary');
+        const title = document.createElement('span');
+        title.textContent = `${record.id ? `#${record.id} · ` : ''}${record.summary}`;
+        summary.append(title, copyButton(() => record.body));
+        const payload = document.createElement('pre');
+        payload.textContent = record.body;
+        element.append(summary, payload);
+      }
+      makeSelectable(element, () => [record]);
+      const sse = record.kind === 'trace' && record.body.match(/^<<< SSE #(\d+)\.(\d+)/);
+      if (sse) {
+        const [, requestNumber, eventNumber] = sse;
+        let group = sseGroups.get(requestNumber);
+        if (!group) {
+          const details = document.createElement('details');
+          const summary = document.createElement('summary');
+          const title = document.createElement('span');
+          const events = document.createElement('div');
+          events.className = 'sse-events';
+          group = { title, events, records: [], count: 0, first: eventNumber };
+          const groupRecords = group.records;
+          makeSelectable(details, () => groupRecords);
+          summary.append(title, copyButton(() => groupRecords.map(recordText).join('\n\n---\n\n'), 'Copy group'));
+          details.append(summary, events);
+          timeline.append(details);
+          sseGroups.set(requestNumber, group);
+        }
+        group.events.append(element);
+        group.records.push(record);
+        group.count += 1;
+        const label = record.summary.split(' · ')[1] || 'SSE event';
+        group.title.textContent = `SSE #${requestNumber} · ${group.count} event${group.count === 1 ? '' : 's'} · #${requestNumber}.${group.first}–#${requestNumber}.${eventNumber} · latest: ${label}`;
+      } else {
+        timeline.append(element);
+      }
+      updateSelection();
+      if (nearBottom) window.scrollTo(0, document.documentElement.scrollHeight);
+    }
+
+    document.getElementById('form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      if (busy || submitting || !connected || !prompt.value.trim()) return;
+      submitting = true;
+      controls();
+      error.textContent = '';
+      const text = prompt.value;
+      try {
+        await request('/prompt', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text })
+        });
+        if (prompt.value === text) prompt.value = '';
+      } catch (exception) {
+        error.textContent = exception.message;
+      } finally {
+        submitting = false;
+        controls();
+        prompt.focus();
+      }
+    });
+
+    prompt.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+        event.preventDefault();
+        document.getElementById('form').requestSubmit();
+      }
+    });
+
+    cancel.addEventListener('click', async () => {
+      error.textContent = '';
+      try {
+        await request('/cancel', { method: 'POST' });
+      } catch (exception) {
+        error.textContent = exception.message;
+      }
+    });
+
+    async function start() {
+      try {
+        const state = await request('/state');
+        document.getElementById('info').textContent = `${state.protocol} · ${state.model} · ${state.workspace}`;
+        busy = state.busy;
+        mode = state.mode;
+        showStatistics(state.statistics);
+        const stream = new EventSource(endpoint('/events'));
+        stream.onopen = () => {
+          connected = true;
+          controls();
+        };
+        stream.onerror = () => {
+          connected = false;
+          controls();
+        };
+        stream.onmessage = (event) => {
+          const record = JSON.parse(event.data);
+          if (record.id && record.id <= lastId) return;
+          if (record.id) lastId = record.id;
+          render(record);
+        };
+      } catch (exception) {
+        error.textContent = exception.message;
+        controls();
+      }
+    }
+    start();
+  </script>
+</body>
+</html>

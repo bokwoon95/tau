@@ -1,4 +1,4 @@
-"""Plain-terminal manual CLI (no sessions, TUI, commands, or agent harness)."""
+"""Manual experiment CLI with terminal and local web frontends (no agent harness)."""
 
 import argparse
 import asyncio
@@ -194,7 +194,7 @@ def count(value: str) -> int:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="Manual Codex native tools versus text-only modes")
     commands = root.add_subparsers(dest="command", required=True)
-    for name in ("login", "run"):
+    for name in ("login", "run", "web"):
         sub = commands.add_parser(name)
         sub.add_argument(
             "--no-trace", action="store_true", help="disable HTTP/SSE diagnostic display"
@@ -211,6 +211,16 @@ def parser() -> argparse.ArgumentParser:
         if name == "login":
             sub.add_argument("--no-browser", action="store_true")
             continue
+        if name == "web":
+            sub.add_argument(
+                "--host", choices=("127.0.0.1", "localhost", "::1"), default="127.0.0.1"
+            )
+            sub.add_argument("--port", type=count, default=8000)
+            sub.add_argument(
+                "--context-window",
+                type=count,
+                help="context window tokens for the web status bar; overrides model metadata",
+            )
         sub.add_argument("--protocol", required=True, choices=("tools", "modes"))
         sub.add_argument("--model", default="gpt-6.1-sol")
         sub.add_argument(
@@ -398,7 +408,12 @@ async def main_async(args: argparse.Namespace) -> int:
 def main() -> None:
     args = parser().parse_args()
     with suppress(KeyboardInterrupt):
-        raise SystemExit(asyncio.run(main_async(args)))
+        if args.command == "web":
+            from mode_experiment.web import serve
+
+            serve(args)
+        else:
+            raise SystemExit(asyncio.run(main_async(args)))
 
 
 if __name__ == "__main__":

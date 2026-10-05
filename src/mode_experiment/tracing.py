@@ -192,6 +192,13 @@ class Output:
                     stream.write(text + "\n")
                     stream.flush()
 
+    def event(self, text: str, *, kind: str, payload: Any) -> None:
+        """Optional structured frontend seam; terminal output stays unchanged."""
+        self.emit(text)
+
+    def statistics(self, payload: dict[str, Any]) -> None:
+        """Optional frontend status update; the terminal keeps its existing usage records."""
+
     def auth_link(self, url: str) -> None:
         # Required user-facing authorization link is the ONLY bypass. It is never
         # copied into the transcript, and query secrets are learned for later logs.

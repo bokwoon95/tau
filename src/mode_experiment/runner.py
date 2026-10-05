@@ -26,6 +26,7 @@ from tau_agent.messages import (
 )
 from tau_agent.provider import ModelProvider
 from tau_agent.provider_events import AssistantDoneEvent, AssistantErrorEvent
+from tau_coding.context_window import estimate_context_usage
 
 
 @dataclass(frozen=True)
@@ -84,11 +85,40 @@ class Runner:
         self.pending: list[ToolCall] = []
         self.active_action: Action | None = None
 
+    def statistics(self) -> dict[str, int | float | bool | None]:
+        """Session totals from accepted responses and the current provider-anchored context."""
+        usages = [m.usage for m in self.messages if isinstance(m, AssistantMessage)]
+        fresh = sum(usage.input for usage in usages)
+        output = sum(usage.output for usage in usages)
+        reads = sum(usage.cache_read for usage in usages)
+        writes = sum(usage.cache_write for usage in usages)
+        total_input = fresh + reads + writes
+        context = estimate_context_usage(
+            system=self.system,
+            messages=tuple(self.messages),
+            tools=tuple(self.backend.tools()) if self.protocol == "tools" else (),
+        )
+        return {
+            "input": fresh,
+            "output": output,
+            "cache_read": reads,
+            "cache_write": writes,
+            "cache_hit_percent": 100 * reads / total_input if total_input else None,
+            "context_tokens": context.total_tokens,
+            "context_provider_anchored": context.uses_provider_usage,
+            "completed_requests": len(usages),
+            "reported_requests": sum(
+                bool(u.total_tokens or u.input or u.output or u.cache_read or u.cache_write)
+                for u in usages
+            ),
+        }
+
     def feedback(self, text: str) -> None:
         if self.protocol == "modes":
             text += "\n" + reminder(self.mode)
         self.output.emit("[harness: feedback] " + text)
         self.messages.append(UserMessage(content="[harness feedback]\n" + text))
+        self.output.statistics(self.statistics())
 
     async def request(self) -> AssistantMessage:
         self.counters.requests += 1
@@ -145,6 +175,7 @@ class Runner:
                 f"[harness: usage] input={usage.input}, output={usage.output}, "
                 f"total={usage.total_tokens}; cost unknown"
             )
+        self.output.statistics(self.statistics())
         return message
 
     async def action(self, action: Action) -> Result:
@@ -152,8 +183,10 @@ class Runner:
             return Result(action.operation, error="action limit exhausted; not executed")
         self.counters.actions += 1
         self.active_action = action
-        self.output.emit(
-            f"[harness: action #{self.counters.actions}] {action.operation} {action.arguments}"
+        self.output.event(
+            f"[harness: action #{self.counters.actions}] {action.operation} {action.arguments}",
+            kind="action",
+            payload={"operation": action.operation, "arguments": action.arguments},
         )
         result = await self.backend.execute(action)
         self.active_action = None
@@ -170,6 +203,7 @@ class Runner:
                 is_error=not result.success,
             )
         )
+        self.output.statistics(self.statistics())
 
     async def native(self, message: AssistantMessage) -> str | None:
         if message.text:
@@ -206,6 +240,11 @@ class Runner:
         return None
 
     async def modal(self, message: AssistantMessage) -> str | None:
+        self.output.event(
+            "[assistant: mode text] " + message.text,
+            kind="mode",
+            payload={"active_mode": self.mode or "control", "text": message.text},
+        )
         try:
             if message.tool_calls:
                 for call in message.tool_calls:
@@ -254,6 +293,7 @@ class Runner:
         self.turn_number += 1
         self.counters = Counters()
         self.messages.append(UserMessage(content=prompt))
+        self.output.statistics(self.statistics())
         if self.protocol == "modes":
             self.feedback("New user turn.")
         answer = None

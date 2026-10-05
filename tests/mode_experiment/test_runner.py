@@ -13,6 +13,7 @@ from tau_agent.messages import (
     ThinkingContent,
     ToolCall,
     ToolResultMessage,
+    Usage,
 )
 from tau_agent.provider_events import AssistantDoneEvent, AssistantErrorEvent, TextDeltaEvent
 from tau_ai.openai_codex import _messages_to_responses_input
@@ -267,6 +268,83 @@ async def test_bounded_protocol_recovery_and_wall_time(tmp_path):
         runner.provider = Scripted(slow)
         runner.limits = Limits(wall_time=0.01)
         assert (await runner.turn("do")).status == "wall-time exhaustion"
+    finally:
+        await backend.close()
+
+
+@pytest.mark.anyio
+async def test_statistics_accumulate_usage_and_track_current_context(tmp_path):
+    class RecordingOutput(Output):
+        def __init__(self):
+            super().__init__(StringIO())
+            self.snapshots = []
+
+        def statistics(self, payload):
+            self.snapshots.append(payload)
+
+    # Construct messages during each request so timestamps follow user/tool feedback.
+    async def call():
+        yield AssistantDoneEvent(
+            message=AssistantMessage(
+                content=[
+                    ToolCall(id="write", name="write", arguments={"path": "f", "content": "x"})
+                ],
+                stop_reason="toolUse",
+                usage=Usage(input=20, output=20, cache_read=80, total_tokens=120),
+            ),
+            reason="toolUse",
+        )
+
+    async def answer():
+        yield AssistantDoneEvent(
+            message=AssistantMessage(
+                content="Done", usage=Usage(input=20, output=10, cache_read=180, total_tokens=210)
+            ),
+            reason="stop",
+        )
+
+    provider = Scripted(call, answer)
+    backend = Backend(tmp_path)
+    output = RecordingOutput()
+    runner = Runner(provider, backend, output, protocol="tools", model="fake")
+    try:
+        assert runner.statistics()["cache_hit_percent"] is None
+        assert (await runner.turn("write f")).answer == "Done"
+        stats = runner.statistics()
+        assert stats["input"] == 40 and stats["output"] == 30
+        assert stats["cache_read"] == 260 and stats["cache_write"] == 0
+        assert stats["cache_hit_percent"] == pytest.approx(100 * 260 / 300)
+        assert stats["context_tokens"] == 210  # latest response, NOT session-total usage
+        assert stats["context_provider_anchored"] is True
+        assert stats["reported_requests"] == stats["completed_requests"] == 2
+        assert any(
+            s["context_tokens"] > 120 and s["completed_requests"] == 1 for s in output.snapshots
+        )  # tool feedback contributes to context between model responses
+    finally:
+        await backend.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("protocol", ["tools", "modes"])
+async def test_statistics_cache_writes_and_missing_usage(tmp_path, protocol):
+    answer = "Done" if protocol == "tools" else "@@tau final\nDone"
+    provider = Scripted(
+        AssistantMessage(
+            content=answer,
+            usage=Usage(input=25, output=5, cache_read=50, cache_write=25, total_tokens=105),
+        ),
+        text(answer),
+    )
+    backend = Backend(tmp_path)
+    runner = Runner(provider, backend, Output(StringIO()), protocol=protocol, model="fake")
+    try:
+        await runner.turn("first")
+        await runner.turn("second")
+        stats = runner.statistics()
+        assert stats["cache_hit_percent"] == 50
+        assert stats["cache_write"] == 25
+        assert stats["completed_requests"] == 2 and stats["reported_requests"] == 1
+        assert stats["context_tokens"] > 105  # missing usage uses the previous anchor + estimates
     finally:
         await backend.close()
 

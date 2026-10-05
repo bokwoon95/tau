@@ -41,10 +41,75 @@ brew install bash
 brew install --cask powershell
 ```
 
+## Web UI
+
+For monospace chat with collapsed, individually expandable diagnostics:
+
+```bash
+uv run --system-certs python -m mode_experiment web --protocol tools --allow-unsafe-local
+uv run --system-certs python -m mode_experiment web --protocol modes --allow-unsafe-local
+```
+
+Run one command and open the private URL printed by the server. Enter submits;
+Shift+Enter inserts a newline. Only user/assistant conversation is shown as chat
+bubbles. HTTP, SSE, tool calls/results, raw mode text, and harness diagnostics
+are ordered collapsed `<details>` with short summaries; expanded JSON is
+pretty-printed and mode source keeps its newlines. SSE frames are additionally
+grouped inside a collapsed row per request (such as `SSE #12`), with an event
+count/range and latest event type. Expand that group to see individually
+expandable frames such as `SSE #12.1` and `SSE #12.2`. Copy buttons copy each
+bubble/diagnostic payload without expanding it; Copy group copies an SSE group.
+Copy All copies every record loaded in the page, including collapsed payloads,
+in chronological order with labels. Copies retain display redaction/truncation
+and the replay limit still applies after reload. Treat copied data as sensitive.
+Ctrl-click (Cmd-click on macOS) toggles highlighted bubbles/events; Shift-click
+adds a visible range from the last toggle-click. Modifier-clicks do not expand
+or collapse details. Copy Selected sits on the right of Send/Interrupt and copies
+selected records chronologically, including collapsed payloads. Selecting an SSE
+group includes its events (also newly arriving ones), without duplicating any
+individually selected events. Ctrl-click again to deselect; copying keeps selection.
+Answers are displayed only
+when complete, like the CLI. Interrupt cancels the active turn.
+
+A live composer status bar shows session totals and current context, for example:
+
+```text
+↑123k ↓21k R2.8M CH99.6% ~24.2%/272k
+```
+
+Input (`↑`) counts fresh tokens, excluding cache reads/writes; output (`↓`)
+includes provider-reported reasoning output. `R` is cache reads, with `W` shown
+when cache writes are reported. `CH` is weighted cache reads / total input.
+Missing response usage is excluded; `?` indicates none reported and `≥` marks
+partial totals. Hover for exact counts/coverage. Context uses the latest provider
+usage plus estimated trailing messages, or text/schema estimates before any
+usage is available. `~` marks the estimate. Orange/red indicate 80%/95% filled.
+There is no cost estimate or automatic compaction.
+
+The window uses exact-model cached/discovered Codex limits, then bundled metadata.
+Use `--discover-models` to query live metadata or `--context-window 272000` to
+override the display window. Unknown limits show `?`; the override does not change
+provider limits. Totals survive browser reload/replay expiration but not server
+restarts.
+
+The server uses FastAPI with vanilla HTML/CSS/JS. Web handling lives in `web.py`;
+the frontend is `web.html`. It reuses the same runner, redaction, credential
+refresh, execution backend, limits, and flags as `run`. Login remains a CLI
+operation. Default bind is `127.0.0.1:8000`; change the port with `--port`.
+Only loopback hosts are supported. The private URL token is required for access;
+keep it secret and **never expose or tunnel this unsandboxed service**.
+
+All tabs share one conversation and one active turn. Reload replays the latest
+2,000 records from memory. Use a private `--trace-file` for a full diagnostic
+transcript. Restarting loses the conversation. Ctrl-C stops the server and
+cleans up execution processes and the temporary workspace unless retained.
+
 ## Workspace, model, and limits
 
 The default workspace is a new, empty temporary directory, never the repository
-or implicit current directory. Startup displays its path and all configuration.
+or implicit current directory. It is a default directory, not an access boundary:
+user-requested operations may use files, dependencies, and binaries elsewhere
+on the host without changing workspaces. Startup displays its path and all configuration.
 Use `--keep-workspace` to retain it after exit. An explicit **existing** workspace
 is modified in place and never automatically removed:
 
