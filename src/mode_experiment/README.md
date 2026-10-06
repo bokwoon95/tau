@@ -1,3 +1,15 @@
+- __init__.py - Package marker; no dependencies.
+- protocols.py - Actions, decisions, mode parsing, and protocol instructions. No experiment-local dependencies.
+- worker.py - Standalone supervisor for persistent interpreters. No experiment-local dependencies.
+- tracing.py - Output, redaction, HTTP tracing, and SSE inspection. No experiment-local dependencies.
+- execution.py - Workspace and execution backend. Uses protocols.py and launches source from worker.py.
+- prompts.py - Builds model instructions using protocols.py.
+- authentication.py - Login and credential resolution; uses tracing.py.
+- runner.py - Conversation and action loop; combines protocols, execution, prompts, and tracing.
+- web.html - Browser interface and its HTTP/event contract.
+- web.py - Web adapter around the runner; uses authentication, execution, tracing, and serves web.html.
+- __main__.py - Final assembly: arguments, terminal interaction, login, and web dispatch. Imports web.py lazily.
+
 # Manual Codex protocol experiment
 
 Compare native tools with raw assistant-text modes interactively. This is not
